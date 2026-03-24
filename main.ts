@@ -297,7 +297,8 @@ async function handler(req: Request): Promise<Response> {
       description: "Agent-native document analysis and web fetch API. No auth required for /analyze/* endpoints.",
       endpoints: {
         "GET  /health": "Health check",
-        "GET  /fetch?url=TARGET&key=KEY": "Proxy fetch (bypass network restrictions)",
+        "GET  /fetch?url=TARGET&key=KEY": "Proxy GET fetch (bypass network restrictions)",
+        "POST /proxy": "Proxy any HTTP request — body: { url, key, method?, headers?, body?, follow_redirects? }",
         "POST /analyze/contract": "Contract risk analysis — body: { text: string }",
         "POST /analyze/summarize": "Text summarization — body: { text: string, sentences?: number }",
         "POST /analyze/diff": "Document diff — body: { text_a: string, text_b: string }",
@@ -339,6 +340,51 @@ async function handler(req: Request): Promise<Response> {
         const text = await res.text();
         return json({ status: res.status, text: text.slice(0, 50000) });
       }
+    } catch (err) {
+      return json({ error: String(err) }, 500);
+    }
+  }
+
+  // ── POST /proxy — forward arbitrary HTTP requests (form POST, JSON POST, etc.) ──
+  if (path === "/proxy" && req.method === "POST") {
+    try {
+      const body = await req.json() as {
+        url: string;
+        key: string;
+        method?: string;
+        headers?: Record<string, string>;
+        body?: string;
+        follow_redirects?: boolean;
+      };
+      const { url: targetUrl, key, method = "POST", headers: reqHeaders = {}, body: reqBody = "", follow_redirects = true } = body;
+
+      if (!targetUrl) return json({ error: "url required" }, 400);
+      if (key !== PROXY_KEY) return json({ error: "invalid key" }, 403);
+
+      const fetchOptions: RequestInit = {
+        method,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          ...reqHeaders,
+        },
+        redirect: follow_redirects ? "follow" : "manual",
+      };
+      if (method !== "GET" && method !== "HEAD" && reqBody) {
+        (fetchOptions as RequestInit & { body: string }).body = reqBody;
+      }
+
+      const res = await fetch(targetUrl, fetchOptions);
+      const responseText = await res.text();
+      const finalUrl = res.url; // after redirects
+
+      // Return all response details for the caller to parse
+      return json({
+        status: res.status,
+        final_url: finalUrl,
+        redirected: res.redirected,
+        headers: Object.fromEntries(res.headers.entries()),
+        text: responseText.slice(0, 100000),
+      });
     } catch (err) {
       return json({ error: String(err) }, 500);
     }
