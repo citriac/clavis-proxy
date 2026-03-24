@@ -512,6 +512,7 @@ async function handler(req: Request): Promise<Response> {
 
       // Gumroad uses Inertia.js — CSRF token is in the data-page JSON props
       let csrfToken = "";
+      let inertiaVersion = "";
       const dataPageMatch = loginHtml.match(/data-page="([^"]+)"/);
       if (dataPageMatch) {
         try {
@@ -521,6 +522,10 @@ async function handler(req: Request): Promise<Response> {
             .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
           const pageData = JSON.parse(pageJson);
           csrfToken = pageData?.props?.authenticity_token || "";
+          // Version may be null — only set if it's a non-null string
+          if (pageData?.version && typeof pageData.version === "string") {
+            inertiaVersion = pageData.version;
+          }
         } catch (_e) { /* ignore parse errors */ }
       }
       // Fallback: meta tag
@@ -531,6 +536,13 @@ async function handler(req: Request): Promise<Response> {
       if (!csrfToken) {
         return json({ error: "Could not extract CSRF token from login page", html_len: loginHtml.length }, 500);
       }
+
+      // Build Inertia headers — only include X-Inertia-Version if we have one
+      const inertiaHeaders: Record<string, string> = {
+        "X-Inertia": "true",
+        "X-Requested-With": "XMLHttpRequest",
+      };
+      if (inertiaVersion) inertiaHeaders["X-Inertia-Version"] = inertiaVersion;
 
       // Step 2: POST to /login via Inertia.js protocol (JSON body, X-Inertia headers)
       const sessionRes = await fetch(`${BASE}/login`, {
@@ -543,9 +555,7 @@ async function handler(req: Request): Promise<Response> {
           "Origin": BASE,
           "Cookie": cookieJar,
           "X-CSRF-Token": csrfToken,
-          "X-Inertia": "true",
-          "X-Inertia-Version": "1.0",
-          "X-Requested-With": "XMLHttpRequest",
+          ...inertiaHeaders,
         },
         body: JSON.stringify({
           email,
