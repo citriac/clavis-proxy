@@ -458,12 +458,174 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
-  // ── Legacy Gumroad endpoints (kept for backward compat) ──
-  if (path.startsWith("/gumroad/")) {
-    return json({
-      error: "Gumroad endpoints deprecated in v2.0",
-      note: "Use /analyze/* for document analysis, /fetch for proxy",
-    }, 410);
+  // ── POST /gumroad/create-product ──
+  // Logs in to Gumroad and creates a digital product, all server-side.
+  // Body: { key, email, password, name, price_cents, description, tags? }
+  if (path === "/gumroad/create-product" && req.method === "POST") {
+    try {
+      const body = await req.json() as {
+        key: string;
+        email: string;
+        password: string;
+        name: string;
+        price_cents: number;
+        description?: string;
+        tags?: string;
+      };
+      const { key, email, password, name, price_cents, description = "", tags = "" } = body;
+      if (key !== PROXY_KEY) return json({ error: "invalid key" }, 403);
+
+      const BASE = "https://app.gumroad.com";
+      const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+
+      // Helper: parse Set-Cookie headers into a cookie jar string
+      function parseCookies(headers: Headers, existing = ""): string {
+        const jar: Record<string, string> = {};
+        // Load existing
+        for (const pair of existing.split(";")) {
+          const [k, ...rest] = pair.trim().split("=");
+          if (k) jar[k.trim()] = rest.join("=").trim();
+        }
+        // Merge new Set-Cookie
+        const raw = headers.get("set-cookie") || "";
+        // Deno's Headers may merge multiple Set-Cookie; split by comma-then-name heuristic
+        const setCookieList: string[] = [];
+        // Try to get all set-cookie values
+        headers.forEach((v, k) => {
+          if (k.toLowerCase() === "set-cookie") setCookieList.push(v);
+        });
+        for (const sc of setCookieList) {
+          const part = sc.split(";")[0];
+          const [ck, ...cv] = part.split("=");
+          if (ck) jar[ck.trim()] = cv.join("=").trim();
+        }
+        return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
+      }
+
+      // Step 1: GET login page → get CSRF token + initial cookies
+      const loginPageRes = await fetch(`${BASE}/login`, {
+        headers: { "User-Agent": UA, Accept: "text/html,*/*" },
+        redirect: "follow",
+      });
+      let cookieJar = parseCookies(loginPageRes.headers);
+      const loginHtml = await loginPageRes.text();
+      const csrfMatch = loginHtml.match(/name="csrf-token"\s+content="([^"]+)"/);
+      const csrfInertia = loginHtml.match(/inertia="meta-name-csrf-token"[^>]*content="([^"]+)"/);
+      // Try both patterns
+      let csrfToken = "";
+      const m1 = loginHtml.match(/content="([^"]+)"\s+inertia="meta-name-csrf-token"/);
+      const m2 = loginHtml.match(/inertia="meta-name-csrf-token"[^>]*>/);
+      if (m1) csrfToken = m1[1];
+      else {
+        // fallback: find csrf-token meta
+        const m3 = loginHtml.match(/<meta[^>]+csrf-token[^>]+content="([^"]+)"/i);
+        if (m3) csrfToken = m3[1];
+      }
+      if (!csrfToken) {
+        return json({ error: "Could not extract CSRF token from login page", html_len: loginHtml.length }, 500);
+      }
+
+      // Step 2: POST to /session to log in (Gumroad's Inertia login endpoint)
+      const loginBody = new URLSearchParams({
+        email,
+        password,
+        authenticity_token: csrfToken,
+        next: "/dashboard",
+      });
+      const sessionRes = await fetch(`${BASE}/session`, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": `${BASE}/login`,
+          "Origin": BASE,
+          "Cookie": cookieJar,
+          "X-CSRF-Token": csrfToken,
+          "Accept": "text/html,application/xhtml+xml,*/*",
+        },
+        body: loginBody.toString(),
+        redirect: "follow",
+      });
+      cookieJar = parseCookies(sessionRes.headers, cookieJar);
+      const sessionFinalUrl = sessionRes.url;
+      const sessionStatus = sessionRes.status;
+      const sessionText = await sessionRes.text();
+
+      // Check if login succeeded (should redirect to /dashboard or similar)
+      const loggedIn = sessionFinalUrl.includes("/dashboard") || sessionFinalUrl.includes("/products") || sessionText.includes("Log Out") || sessionText.includes("dashboard");
+      if (!loggedIn) {
+        return json({
+          error: "Login failed",
+          final_url: sessionFinalUrl,
+          status: sessionStatus,
+          hint: sessionText.slice(0, 300),
+          cookie_jar_len: cookieJar.length,
+        }, 401);
+      }
+
+      // Step 3: GET /products/new to get fresh CSRF for product creation
+      const newProductRes = await fetch(`${BASE}/products/new`, {
+        headers: {
+          "User-Agent": UA,
+          "Cookie": cookieJar,
+          "Accept": "text/html,*/*",
+          "Referer": `${BASE}/dashboard`,
+        },
+        redirect: "follow",
+      });
+      cookieJar = parseCookies(newProductRes.headers, cookieJar);
+      const newProductHtml = await newProductRes.text();
+      const csrfMatch2 = newProductHtml.match(/content="([^"]+)"\s+inertia="meta-name-csrf-token"/);
+      const productCsrf = csrfMatch2 ? csrfMatch2[1] : csrfToken; // fallback to login csrf
+
+      // Step 4: POST to create product via Inertia (JSON)
+      const productPayload = {
+        name,
+        price_range: String(price_cents),
+        currency_type: "usd",
+        description,
+        tags,
+        product_type: "digital",
+        is_physical: false,
+        require_shipping: false,
+      };
+
+      const createRes = await fetch(`${BASE}/products`, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/json",
+          "Cookie": cookieJar,
+          "X-CSRF-Token": productCsrf,
+          "X-Inertia": "true",
+          "X-Inertia-Version": "1.0",
+          "X-Requested-With": "XMLHttpRequest",
+          "Referer": `${BASE}/products/new`,
+          "Origin": BASE,
+          "Accept": "application/json, text/plain, */*",
+        },
+        body: JSON.stringify(productPayload),
+        redirect: "follow",
+      });
+      cookieJar = parseCookies(createRes.headers, cookieJar);
+      const createStatus = createRes.status;
+      const createFinalUrl = createRes.url;
+      const createText = await createRes.text();
+
+      let createData: unknown = null;
+      try { createData = JSON.parse(createText); } catch { createData = createText.slice(0, 500); }
+
+      return json({
+        success: createStatus < 400,
+        login_final_url: sessionFinalUrl,
+        create_status: createStatus,
+        create_final_url: createFinalUrl,
+        create_response: createData,
+      });
+
+    } catch (err) {
+      return json({ error: String(err) }, 500);
+    }
   }
 
   return json({ error: "Not found", path }, 404);
