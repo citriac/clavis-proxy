@@ -502,48 +502,57 @@ async function handler(req: Request): Promise<Response> {
         return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
       }
 
-      // Step 1: GET login page → get CSRF token + initial cookies
+      // Step 1: GET login page → get CSRF token (from Inertia data-page props) + session cookie
       const loginPageRes = await fetch(`${BASE}/login`, {
         headers: { "User-Agent": UA, Accept: "text/html,*/*" },
         redirect: "follow",
       });
       let cookieJar = parseCookies(loginPageRes.headers);
       const loginHtml = await loginPageRes.text();
-      const csrfMatch = loginHtml.match(/name="csrf-token"\s+content="([^"]+)"/);
-      const csrfInertia = loginHtml.match(/inertia="meta-name-csrf-token"[^>]*content="([^"]+)"/);
-      // Try both patterns
+
+      // Gumroad uses Inertia.js — CSRF token is in the data-page JSON props
       let csrfToken = "";
-      const m1 = loginHtml.match(/content="([^"]+)"\s+inertia="meta-name-csrf-token"/);
-      const m2 = loginHtml.match(/inertia="meta-name-csrf-token"[^>]*>/);
-      if (m1) csrfToken = m1[1];
-      else {
-        // fallback: find csrf-token meta
-        const m3 = loginHtml.match(/<meta[^>]+csrf-token[^>]+content="([^"]+)"/i);
-        if (m3) csrfToken = m3[1];
+      const dataPageMatch = loginHtml.match(/data-page="([^"]+)"/);
+      if (dataPageMatch) {
+        try {
+          // unescape HTML entities in the data-page attribute
+          const pageJson = dataPageMatch[1]
+            .replace(/&quot;/g, '"').replace(/&#039;/g, "'")
+            .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+          const pageData = JSON.parse(pageJson);
+          csrfToken = pageData?.props?.authenticity_token || "";
+        } catch (_e) { /* ignore parse errors */ }
+      }
+      // Fallback: meta tag
+      if (!csrfToken) {
+        const m = loginHtml.match(/content="([^"]+)"\s+inertia="meta-name-csrf-token"/);
+        if (m) csrfToken = m[1];
       }
       if (!csrfToken) {
         return json({ error: "Could not extract CSRF token from login page", html_len: loginHtml.length }, 500);
       }
 
-      // Step 2: POST to /session to log in (Gumroad's Inertia login endpoint)
-      const loginBody = new URLSearchParams({
-        email,
-        password,
-        authenticity_token: csrfToken,
-        next: "/dashboard",
-      });
-      const sessionRes = await fetch(`${BASE}/session`, {
+      // Step 2: POST to /login via Inertia.js protocol (JSON body, X-Inertia headers)
+      const sessionRes = await fetch(`${BASE}/login`, {
         method: "POST",
         headers: {
           "User-Agent": UA,
-          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Type": "application/json",
+          "Accept": "text/html, application/xhtml+xml",
           "Referer": `${BASE}/login`,
           "Origin": BASE,
           "Cookie": cookieJar,
           "X-CSRF-Token": csrfToken,
-          "Accept": "text/html,application/xhtml+xml,*/*",
+          "X-Inertia": "true",
+          "X-Inertia-Version": "1.0",
+          "X-Requested-With": "XMLHttpRequest",
         },
-        body: loginBody.toString(),
+        body: JSON.stringify({
+          email,
+          password,
+          authenticity_token: csrfToken,
+          next: "/dashboard",
+        }),
         redirect: "follow",
       });
       cookieJar = parseCookies(sessionRes.headers, cookieJar);
@@ -551,17 +560,26 @@ async function handler(req: Request): Promise<Response> {
       const sessionStatus = sessionRes.status;
       const sessionText = await sessionRes.text();
 
-      // Check if login succeeded (should redirect to /dashboard or similar)
-      const loggedIn = sessionFinalUrl.includes("/dashboard") || sessionFinalUrl.includes("/products") || sessionText.includes("Log Out") || sessionText.includes("dashboard");
-      if (!loggedIn) {
+      // Check if login succeeded — Inertia returns 200 with redirect component, or actual dashboard
+      let loginOk = sessionFinalUrl.includes("/dashboard") || sessionFinalUrl.includes("/products");
+      if (!loginOk) {
+        // Inertia may return 200 with a redirect JSON payload
+        try {
+          const inertiaResp = JSON.parse(sessionText);
+          if (inertiaResp?.component === "Dashboard" || inertiaResp?.url?.includes("dashboard")) loginOk = true;
+        } catch { /* not json */ }
+      }
+      if (!loginOk && sessionStatus >= 400) {
         return json({
           error: "Login failed",
           final_url: sessionFinalUrl,
           status: sessionStatus,
-          hint: sessionText.slice(0, 300),
+          hint: sessionText.slice(0, 400),
           cookie_jar_len: cookieJar.length,
         }, 401);
       }
+      // If we got 200 and didn't land on dashboard, we still might be logged in
+      // (Inertia redirects via props.url). Proceed and verify via /products/new.
 
       // Step 3: GET /products/new to get fresh CSRF for product creation
       const newProductRes = await fetch(`${BASE}/products/new`, {
