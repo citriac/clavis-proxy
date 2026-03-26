@@ -23,6 +23,13 @@
 
 const PROXY_KEY = Deno.env.get("PROXY_SECRET") || "clavis-proxy-2026";
 
+// ── Deno KV for analytics ──
+let kv: Deno.Kv | null = null;
+async function getKv(): Promise<Deno.Kv> {
+  if (!kv) kv = await Deno.openKv();
+  return kv;
+}
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -293,12 +300,14 @@ async function handler(req: Request): Promise<Response> {
   if (path === "/" || path === "") {
     return json({
       service: "Clavis Agent API",
-      version: "2.0.0",
-      description: "Agent-native document analysis and web fetch API. No auth required for /analyze/* endpoints.",
+      version: "2.1.0",
+      description: "Agent-native document analysis, web fetch, and privacy-first analytics API.",
       endpoints: {
         "GET  /health": "Health check",
         "GET  /fetch?url=TARGET&key=KEY": "Proxy GET fetch (bypass network restrictions)",
         "POST /proxy": "Proxy any HTTP request — body: { url, key, method?, headers?, body?, follow_redirects? }",
+        "POST /track": "Pageview beacon — body: { page: string, ref?: string } (no auth)",
+        "GET  /stats": "Aggregated analytics — total/daily pageviews, top pages (no auth)",
         "POST /analyze/contract": "Contract risk analysis — body: { text: string }",
         "POST /analyze/summarize": "Text summarization — body: { text: string, sentences?: number }",
         "POST /analyze/diff": "Document diff — body: { text_a: string, text_b: string }",
@@ -314,7 +323,7 @@ async function handler(req: Request): Promise<Response> {
 
   // ── /health ──
   if (path === "/health") {
-    return json({ status: "ok", ts: new Date().toISOString(), version: "2.0.0" });
+    return json({ status: "ok", ts: new Date().toISOString(), version: "2.1.0" });
   }
 
   // ── GET /fetch ──
@@ -656,8 +665,76 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
+  // ── POST /track — receive a pageview beacon ──
+  // Body: { page: string, ref?: string }  (no auth required, CORS open)
+  if (path === "/track" && req.method === "POST") {
+    try {
+      const body = await req.json() as { page?: string; ref?: string };
+      const page = (body.page || "/").slice(0, 200);
+      const ref = (body.ref || "").slice(0, 200);
+      const day = new Date().toISOString().slice(0, 10); // "2026-03-27"
+      const db = await getKv();
+
+      // Increment total counter
+      await db.atomic()
+        .mutate({ type: "sum", key: ["pv", "total"], value: new Deno.KvU64(1n) })
+        .mutate({ type: "sum", key: ["pv", "day", day], value: new Deno.KvU64(1n) })
+        .mutate({ type: "sum", key: ["pv", "page", page], value: new Deno.KvU64(1n) })
+        .commit();
+
+      return json({ ok: true });
+    } catch (_e) {
+      // Never fail silently for analytics — just return ok
+      return json({ ok: true });
+    }
+  }
+
+  // ── GET /stats — return aggregated analytics ──
+  if (path === "/stats" && req.method === "GET") {
+    try {
+      const db = await getKv();
+      const today = new Date().toISOString().slice(0, 10);
+
+      // Total pageviews
+      const totalEntry = await db.get<Deno.KvU64>(["pv", "total"]);
+      const total = Number(totalEntry.value?.value ?? 0n);
+
+      // Today's pageviews
+      const todayEntry = await db.get<Deno.KvU64>(["pv", "day", today]);
+      const todayPv = Number(todayEntry.value?.value ?? 0n);
+
+      // Per-page counts (list all)
+      const pages: Array<{ page: string; views: number }> = [];
+      const iter = db.list<Deno.KvU64>({ prefix: ["pv", "page"] });
+      for await (const entry of iter) {
+        const page = entry.key[2] as string;
+        pages.push({ page, views: Number(entry.value.value) });
+      }
+      pages.sort((a, b) => b.views - a.views);
+
+      // Last 30 days
+      const days: Array<{ date: string; views: number }> = [];
+      const dayIter = db.list<Deno.KvU64>({ prefix: ["pv", "day"] });
+      for await (const entry of dayIter) {
+        const date = entry.key[2] as string;
+        days.push({ date, views: Number(entry.value.value) });
+      }
+      days.sort((a, b) => a.date.localeCompare(b.date));
+
+      return json({
+        total_pageviews: total,
+        today_pageviews: todayPv,
+        top_pages: pages.slice(0, 20),
+        daily: days.slice(-30),
+        generated_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      return json({ error: String(err) }, 500);
+    }
+  }
+
   return json({ error: "Not found", path }, 404);
 }
 
-console.log("Clavis Agent API v2.0 starting...");
+console.log("Clavis Agent API v2.1 starting...");
 Deno.serve(handler);
